@@ -6,8 +6,8 @@
 #include "fft.hpp"
 #include <cinttypes>
 #if defined(ARDUINO_M5STACK_CORES3)
-  #include <gob_unifiedButton.hpp>
-  goblib::UnifiedButton unifiedButton;
+  #include <WiFi.h>
+  #include <HTTPClient.h>
 #endif
 #define USE_MIC
 
@@ -41,6 +41,60 @@ uint8_t palette_index = 0;
 
 uint32_t last_rotation_msec = 0;
 uint32_t last_lipsync_max_msec = 0;
+
+#if defined(ARDUINO_M5STACK_CORES3)
+// WiFi設定（適宜変更してください）
+const char* ssid = "******";
+const char* password = "********";
+const char* post_url = "http://pi.local:8100/clicked";
+
+void sendTouchEvent() {
+  Serial.println("=== Touch Event Detected ===");
+  Serial.print("Timestamp: ");
+  Serial.println(millis());
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi Status: Connected (IP: ");
+    Serial.print(WiFi.localIP());
+    Serial.println(")");
+    
+    HTTPClient http;
+    http.begin(post_url);
+    http.addHeader("Content-Type", "application/json");
+    
+    String payload = "{\"event\":\"touch\",\"device\":\"M5Stack CoreS3\",\"timestamp\":" + String(millis()) + "}";
+    
+    Serial.print("POST URL: ");
+    Serial.println(post_url);
+    Serial.print("Payload: ");
+    Serial.println(payload);
+    Serial.println("Sending POST request...");
+    
+    int httpResponseCode = http.POST(payload);
+    
+    if (httpResponseCode > 0) {
+      Serial.print("HTTP Response Code: ");
+      Serial.println(httpResponseCode);
+      String response = http.getString();
+      Serial.print("Response Body: ");
+      Serial.println(response);
+      M5_LOGI("POST Success - Response: %d", httpResponseCode);
+    } else {
+      Serial.print("HTTP Error Code: ");
+      Serial.println(httpResponseCode);
+      M5_LOGI("POST Failed - Error: %d", httpResponseCode);
+    }
+    
+    http.end();
+    Serial.println("=== POST Request Complete ===");
+  } else {
+    Serial.println("WiFi Status: Disconnected");
+    Serial.println("Cannot send POST request - WiFi not connected");
+    M5_LOGI("WiFi not connected");
+  }
+  Serial.println();
+}
+#endif
 
 void lipsync() {
   
@@ -96,7 +150,49 @@ void setup()
   cfg.internal_mic = true;
   M5.begin(cfg);
 #if defined( ARDUINO_M5STACK_CORES3 )
-  unifiedButton.begin(&M5.Display, goblib::UnifiedButton::appearance_t::transparent_all);
+  // WiFi接続
+  Serial.println("=== WiFi Connection Setup ===");
+  Serial.print("SSID: ");
+  Serial.println(ssid);
+  Serial.println("Connecting to WiFi...");
+  
+  WiFi.begin(ssid, password);
+  M5_LOGI("Connecting to WiFi...");
+  
+  int connect_attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && connect_attempts < 30) {
+    delay(1000);
+    connect_attempts++;
+    Serial.print(".");
+    if (connect_attempts % 10 == 0) {
+      Serial.println();
+      Serial.print("Still connecting... (");
+      Serial.print(connect_attempts);
+      Serial.println(" seconds)");
+    }
+    M5_LOGI("Connecting...");
+  }
+  Serial.println();
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi Connected Successfully!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("MAC Address: ");
+    Serial.println(WiFi.macAddress());
+    Serial.print("Signal Strength (RSSI): ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
+    Serial.print("POST URL: ");
+    Serial.println(post_url);
+    M5_LOGI("WiFi connected: %s", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("WiFi Connection Failed!");
+    Serial.println("Touch events will not be sent.");
+    M5_LOGI("WiFi connection failed");
+  }
+  Serial.println("=== WiFi Setup Complete ===");
+  Serial.println();
 #endif
   M5.Log.setLogLevel(m5::log_target_display, ESP_LOG_NONE);
   M5.Log.setLogLevel(m5::log_target_serial, ESP_LOG_INFO);
@@ -158,6 +254,7 @@ void setup()
 
     case m5::board_t::board_M5StackCoreS3:
     case m5::board_t::board_M5StackCoreS3SE:
+      first_cps = 3; // 黒背景白顔に固定
       scale = 1.0f;
       position_top = 0;
       position_left = 0;
@@ -230,8 +327,24 @@ void loop()
   M5.update();
 
 #if defined( ARDUINO_M5STACK_CORES3 )
-  unifiedButton.update();
-#endif
+  // タッチスクリーンが押されたらPOSTリクエストを送信
+  if (M5.Touch.getCount() > 0) {
+    static uint32_t last_touch_time = 0;
+    uint32_t current_time = millis();
+    // タッチイベントの重複を防ぐため500ms間隔でチェック
+    if (current_time - last_touch_time > 500) {
+      Serial.print("Touch detected! Count: ");
+      Serial.print(M5.Touch.getCount());
+      Serial.print(", Time since last touch: ");
+      Serial.print(current_time - last_touch_time);
+      Serial.println("ms");
+      
+      M5_LOGI("Touch detected, sending POST request");
+      sendTouchEvent();
+      last_touch_time = current_time;
+    }
+  }
+#else
   if (M5.BtnA.wasPressed()) {
     M5_LOGI("Push BtnA");
     palette_index++;
@@ -240,6 +353,7 @@ void loop()
     }
     avatar.setColorPalette(*cps[palette_index]);
   }
+#endif
   if (M5.BtnA.wasDoubleClicked()) {
     M5.Display.setRotation(3);
   }
@@ -260,3 +374,8 @@ void loop()
   lipsync();
   lgfx::v1::delay(1);
 }
+
+//このコードの大部分はtakakoさんが書いたものであり、m5stackプロジェクトの中の"スタックチャン"というプロジェクトのまた派生の
+//m5stack-avater-micというものを改造してイベントトリガーとなるようにコードを書き換えてください。
+//もしこのコメントを読んでいるなら、starはここではなくm5stack-avater-micにstarをつけてください。
+//また、もしこのロボットを作るのなら(多分いない)M5StackCoreS3以外の動作確認はしていないのでご了承ください。
